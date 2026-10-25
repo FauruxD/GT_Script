@@ -1,0 +1,100 @@
+
+-- BOTHAX AUTO SELL LXFS
+-- Inventory Check + Block Dialog
+
+local config = {
+    items = {3026, 3226, 3000, 3434, 5100, 3222},
+    sellDelay = 25,
+    confirmDelay = 25,
+    loopDelay = 25,
+    blockDialog = true
+}
+
+local hookName = "LXFS_BLOCK_DIALOG"
+
+-- Hapus hook lama jika ada
+pcall(function()
+    RemoveHook(hookName)
+end)
+
+-- Block dialog LXFS
+AddHook("OnVariant", hookName, function(var, netid, delay)
+    if not config.blockDialog then
+        return false
+    end
+
+    if var[0] == "OnDialogRequest" then
+        local dialog = var[1]
+
+        if type(dialog) == "string" then
+            if dialog:find("lxfs_menu", 1, true)
+                or dialog:find("lxfs_confirm", 1, true)
+            then
+                return true
+            end
+        end
+    end
+
+    return false
+end)
+
+-- Ambil jumlah item dari inventory
+local function getItemAmount(itemID)
+    local inventory = GetInventory()
+
+    if not inventory then
+        return 0
+    end
+
+    for _, item in pairs(inventory) do
+        if item.id == itemID then
+            return item.amount
+        end
+    end
+
+    return 0
+end
+
+-- Kirim packet dialog
+local function sendDialog(name, button)
+    local packet =
+        "action|dialog_return\n" ..
+        "dialog_name|" .. name .. "\n" ..
+        "buttonClicked|" .. button
+
+    SendPacket(2, packet)
+end
+
+-- Jual item jika tersedia
+local function sellItem(id)
+    local amount = getItemAmount(id)
+
+    if amount <= 0 then
+        return
+    end
+
+    sendDialog(
+        "lxfs_menu",
+        "lxfs_sell_" .. id .. "_1"
+    )
+
+    Sleep(config.sellDelay)
+
+    sendDialog(
+        "lxfs_confirm",
+        "lxfs_confirm_sale"
+    )
+
+    Sleep(config.confirmDelay)
+end
+
+-- Main Loop
+LogToConsole("`2[Auto Sell] Started!")
+
+while true do
+    for _, id in ipairs(config.items) do
+        sellItem(id)
+    end
+
+    Sleep(config.loopDelay)
+end
