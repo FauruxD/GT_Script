@@ -1,0 +1,969 @@
+--[[
+  BOTHAX PC - WORLD COPY / PASTE V5 ABOVE-PLAYER + AUTO REPAIR (ImGui)
+  Storage: %APPDATA%\Growtopia\scripts\worldcopy\<WORLD>.txt
+  Features: copy, list, material breakdown, paste, refresh, delete, stop.
+  F1 (Bothax PC OnInput) toggles ImGui visibility; the job continues when hidden.
+  NEW V5: stand at target Y+1 so placements go UP (target Y=player Y-1).
+  Never teleport ABOVE the target row. Sideways fallback if the below row is blocked.
+
+  Copies foreground/background item IDs and tile coordinates ONLY.
+  Does not clone lock permissions, signs, containers, tile extras, etc.
+  Pasting never breaks an occupied tile or buys items. Conflicts are skipped.
+  Requires Bothax's usual Lua IO functions: io.open, os.remove, etc.
+  If file IO or mkdir is blocked by the executor, create worldcopy manually.
+]]
+
+local CFG = {
+    storageFolder = "",     -- optional absolute folder; blank = Windows scripts/worldcopy
+    groupSize = 5,
+    teleportWaitMs = 120,       -- tunggu singkat tiap percobaan FindPath
+    teleportRetries = 2,
+    placeDelayMs = 90,          -- jeda antar packet placement
+    betweenGroupsMs = 0,       -- tidak perlu menunggu grup tanpa pekerjaan
+    inventoryCheck = true,
+    inventoryRefreshEvery = 50, -- hemat panggilan GetInventory
+    recheckTargetWithGetTile = false, -- opsi ekstra aman namun lebih lambat
+    verifyAfterPaste = true,   -- scan sesudah paste
+    autoRepair = true,         -- tambal tile kosong yang tertinggal di akhir
+    maxRepairPasses = 3,      -- maksimum 3 putaran tambal (bukan loop tanpa akhir)
+    repairSettleMs = 750,     -- tunggu server update sebelum scan ulang
+    maxNoProgressPasses = 2,  -- hentikan jika 2 putaran tidak mengurangi sisa
+    useFindPath = true,
+    allowSameRowFallback = true, -- jika bawah terhalang, pilih posisi sejajar; tidak pernah di atas
+    showItemNames = true,
+    materialsPerPage = 16,
+    worldsPerPage = 14,
+    logEveryActions = 100
+}
+
+local state = {
+    names = {}, selected = nil, snapshot = nil, materials = {},
+    inventory = {}, materialPage = 1, worldPage = 1,
+    busy = false, job = "", stop = false, confirmDelete = false,
+    status = "Membaca worldcopy...", progress = { row = 0, group = 0, groups = 0,
+        sent = 0, matched = 0, conflicts = 0, noStock = 0, pathFails = 0 },
+    storage = "", sep = "\\",
+    uiVisible = true,
+    lastF1Toggle = -10
+}
+
+local function log(msg)
+    if LogToConsole then LogToConsole("`2[WorldCopy]`` " .. tostring(msg)) end
+end
+
+local function getPathSeparator()
+    if package and type(package.config) == "string" then
+        local first = package.config:sub(1, 1)
+        if first == "\\" or first == "/" then return first end
+    end
+    return "\\"
+end
+
+local function initStoragePath()
+    state.sep = getPathSeparator()
+    if CFG.storageFolder ~= "" then
+        state.storage = CFG.storageFolder
+        return
+    end
+    local appdata = nil
+    if os and type(os.getenv) == "function" then
+        local ok, value = pcall(os.getenv, "APPDATA")
+        if ok then appdata = value end
+    end
+    if appdata and appdata ~= "" then
+        state.storage = appdata .. state.sep .. "Growtopia" .. state.sep .. "scripts" .. state.sep .. "worldcopy"
+    else
+        state.storage = "worldcopy" -- cwd fallback; set CFG.storageFolder if needed
+    end
+end
+
+local function join(name)
+    return state.storage .. state.sep .. name
+end
+
+local function normalizeName(name)
+    if type(name) ~= "string" then return nil end
+    local normalized = name:upper():gsub("[^A-Z0-9_%-]", "")
+    if #normalized < 1 or #normalized > 64 then return nil end
+    return normalized
+end
+
+local function canOpenForWrite(path)
+    if not io or type(io.open) ~= "function" then return false end
+    local ok, file = pcall(io.open, path, "w")
+    if ok and file then file:close(); return true end
+    return false
+end
+
+local function ensureFolder()
+    if not io or type(io.open) ~= "function" then
+        return false, "Lua io.open tidak tersedia di build Bothax ini"
+    end
+    local probe = join(".worldcopy_probe")
+    if canOpenForWrite(probe) then
+        if os and type(os.remove) == "function" then pcall(os.remove, probe) end
+        return true
+    end
+    -- Windows mkdir fallback; cannot rely on undocumented Lua filesystem APIs.
+    if os and type(os.execute) == "function" then
+        local command
+        if state.sep == "\\" then
+            command = 'cmd /c if not exist "' .. state.storage .. '" mkdir "' .. state.storage .. '"'
+        else
+            command = 'mkdir -p "' .. state.storage .. '"'
+        end
+        pcall(os.execute, command)
+    end
+    if canOpenForWrite(probe) then
+        if os and type(os.remove) == "function" then pcall(os.remove, probe) end
+        return true
+    end
+    return false, "Tidak bisa membuat/menulis folder " .. state.storage .. "; buat manual lalu Refresh List"
+end
+
+local function pathOfWorld(name)
+    local safe = normalizeName(name)
+    if not safe then return nil end
+    return join(safe .. ".txt")
+end
+
+local function fileExists(path)
+    if not path then return false end
+    local ok, file = pcall(io.open, path, "r")
+    if ok and file then file:close(); return true end
+    return false
+end
+
+local function worldInfo()
+    if type(GetWorld) ~= "function" then return nil, "GetWorld tidak tersedia" end
+    local world = GetWorld()
+    if not world or not world.name or world.name == "" or world.name == "EXIT" then
+        return nil, "Masuk ke world terlebih dahulu"
+    end
+    local name = normalizeName(tostring(world.name))
+    local w, h = tonumber(world.width), tonumber(world.height)
+    if not name or not w or not h or w <= 0 or h <= 0 or w > 1000 or h > 1000 then
+        return nil, "Informasi world tidak valid"
+    end
+    return { name = name, width = math.floor(w), height = math.floor(h) }
+end
+
+local function readIndex()
+    local names, seen = {}, {}
+    local file = io.open(join("index.txt"), "r")
+    if file then
+        for line in file:lines() do
+            local name = normalizeName(line)
+            if name and not seen[name] and fileExists(pathOfWorld(name)) then
+                seen[name] = true; names[#names+1] = name
+            end
+        end
+        file:close()
+    end
+    -- Optionally also pick up .txt worlds dropped into the folder by the user.
+    -- io.popen is not guaranteed by Bothax, hence index.txt is authoritative.
+    if state.sep == "\\" and io and type(io.popen) == "function" then
+        local ok, pipe = pcall(io.popen, 'cmd /c dir /b /a-d "' .. join("*.txt") .. '" 2>nul', "r")
+        if ok and pipe then
+            pcall(function()
+                for filename in pipe:lines() do
+                    if filename:lower() ~= "index.txt" then
+                        local raw = filename:match("^(.+)%.txt$")
+                        local name = normalizeName(raw)
+                        if name and not seen[name] and raw:upper() == name then
+                            seen[name] = true; names[#names+1] = name
+                        end
+                    end
+                end
+            end)
+            pcall(function() pipe:close() end)
+        end
+    end
+    table.sort(names)
+    return names
+end
+
+local function writeIndex(names)
+    local file, err = io.open(join("index.txt"), "w")
+    if not file then return false, tostring(err) end
+    for _, name in ipairs(names) do file:write(name, "\n") end
+    file:close()
+    return true
+end
+
+local function containsName(names, name)
+    for _, n in ipairs(names) do if n == name then return true end end
+    return false
+end
+
+local function refreshInternal()
+    local ok, err = ensureFolder()
+    if not ok then error(err) end
+    local names = readIndex()
+    state.names = names
+    if state.selected and not containsName(names, state.selected) then
+        state.selected = nil; state.snapshot = nil; state.materials = {}
+    end
+    state.status = "Daftar dimuat: " .. #names .. " world"
+end
+
+local function cellIndex(w, x, y)
+    return y * w + x + 1
+end
+
+local function extractTileXY(tile)
+    if type(tile) ~= "table" then return nil end
+    local x, y = tile.x, tile.y
+    if (x == nil or y == nil) and type(tile.pos) == "table" then
+        x, y = tile.pos.x, tile.pos.y
+    end
+    return tonumber(x), tonumber(y)
+end
+
+local function snapshotCurrentWorld()
+    local world, err = worldInfo()
+    if not world then error(err) end
+    if type(GetTile) ~= "function" and type(GetTiles) ~= "function" then
+        error("GetTile dan GetTiles tidak tersedia")
+    end
+    local snap = { name = world.name, width = world.width, height = world.height, cells = {} }
+    if type(GetTiles) == "function" then
+        local tiles = GetTiles() or {}
+        for _, tile in pairs(tiles) do
+            local x, y = extractTileXY(tile)
+            if x and y and x >= 0 and x < world.width and y >= 0 and y < world.height then
+                snap.cells[cellIndex(world.width, x, y)] = {
+                    fg = math.floor(tonumber(tile.fg) or 0),
+                    bg = math.floor(tonumber(tile.bg) or 0)
+                }
+            end
+        end
+    end
+    for y = 0, world.height - 1 do
+        if state.stop then error("Copy dibatalkan") end
+        for x = 0, world.width - 1 do
+            local i = cellIndex(world.width, x, y)
+            if not snap.cells[i] then
+                if type(GetTile) ~= "function" then
+                    error("Data tile tidak lengkap pada " .. x .. "," .. y)
+                end
+                local tile = GetTile(x, y)
+                if not tile then error("Tidak bisa membaca tile " .. x .. "," .. y) end
+                snap.cells[i] = {
+                    fg = math.floor(tonumber(tile.fg) or 0),
+                    bg = math.floor(tonumber(tile.bg) or 0)
+                }
+            end
+        end
+    end
+    local now = worldInfo()
+    if not now or now.name ~= world.name then error("World berubah saat copy; batal") end
+    return snap
+end
+
+local function saveSnapshot(snap)
+    local ok, err = ensureFolder()
+    if not ok then error(err) end
+    local filepath = pathOfWorld(snap.name)
+    if not filepath then error("Nama world tidak valid") end
+    local file, openErr = io.open(filepath, "w")
+    if not file then error("Gagal membuat .txt: " .. tostring(openErr)) end
+    file:write("BOTHAX_WORLDCOPY_V1\n")
+    file:write("NAME|", snap.name, "\n")
+    file:write("SIZE|", snap.width, "|", snap.height, "\n")
+    local fgCount, bgCount = 0, 0
+    for y = 0, snap.height - 1 do
+        for x = 0, snap.width - 1 do
+            local cell = snap.cells[cellIndex(snap.width, x, y)]
+            file:write("T|", x, "|", y, "|", cell.fg, "|", cell.bg, "\n")
+            if cell.fg > 0 then fgCount = fgCount + 1 end
+            if cell.bg > 0 then bgCount = bgCount + 1 end
+        end
+    end
+    file:close()
+    local names = readIndex()
+    if not containsName(names, snap.name) then names[#names+1] = snap.name end
+    table.sort(names)
+    local idxOk, idxErr = writeIndex(names)
+    if not idxOk then error("World .txt tersimpan, tetapi index gagal: " .. tostring(idxErr)) end
+    state.names = names
+    return fgCount, bgCount
+end
+
+local function parseSnapshot(name)
+    local filepath = pathOfWorld(name)
+    if not filepath then error("Nama world invalid") end
+    local file, err = io.open(filepath, "r")
+    if not file then error("File tidak terbaca: " .. tostring(err)) end
+    local signature = file:read("*l")
+    if signature ~= "BOTHAX_WORLDCOPY_V1" then file:close(); error("Format .txt tidak dikenal") end
+    local nameLine = file:read("*l") or ""
+    local sizeLine = file:read("*l") or ""
+    local savedName = nameLine:match("^NAME|([A-Z0-9_%-]+)$")
+    local w, h = sizeLine:match("^SIZE|(%d+)|(%d+)$")
+    w, h = tonumber(w), tonumber(h)
+    if not savedName or not w or not h or w < 1 or h < 1 or w > 1000 or h > 1000 then
+        file:close(); error("Header world .txt rusak")
+    end
+    local snap = { name = savedName, width = w, height = h, cells = {} }
+    local materials, counts, lines = {}, {}, 0
+    for line in file:lines() do
+        local x, y, fg, bg = line:match("^T|(%d+)|(%d+)|(%d+)|(%d+)$")
+        x, y, fg, bg = tonumber(x), tonumber(y), tonumber(fg), tonumber(bg)
+        if not x or not y or not fg or not bg or x >= w or y >= h then
+            file:close(); error("Baris data tile tidak valid pada baris " .. tostring(lines+4))
+        end
+        local i = cellIndex(w, x, y)
+        if snap.cells[i] then file:close(); error("Tile duplikat di file") end
+        snap.cells[i] = {fg=fg, bg=bg}
+        lines = lines + 1
+        if fg ~= 0 then counts[fg] = (counts[fg] or 0) + 1 end
+        if bg ~= 0 then counts[bg] = (counts[bg] or 0) + 1 end
+    end
+    file:close()
+    if lines ~= w*h then error("Data tile tidak lengkap (" .. lines .. "/" .. w*h .. ")") end
+    for itemid, needed in pairs(counts) do materials[#materials+1] = {id=itemid, needed=needed} end
+    table.sort(materials, function(a,b)
+        if a.needed ~= b.needed then return a.needed > b.needed end
+        return a.id < b.id
+    end)
+    return snap, materials
+end
+
+local function inventoryMap()
+    local inv = {}
+    if type(GetInventory) == "function" then
+        local ok, items = pcall(GetInventory)
+        if ok and type(items) == "table" then
+            for _, item in pairs(items) do
+                local id, amount = tonumber(item.id), tonumber(item.amount)
+                if id and amount then inv[id] = (inv[id] or 0) + amount end
+            end
+        end
+    end
+    return inv
+end
+
+local itemLabelCache = {}
+local function itemLabel(itemid)
+    local cached = itemLabelCache[itemid]
+    if cached then return cached end
+    local label = tostring(itemid)
+    if CFG.showItemNames and type(GetItemByIDSafe) == "function" then
+        local ok, info = pcall(GetItemByIDSafe, itemid)
+        if ok and info and type(info.name) == "string" and info.name ~= "" then
+            label = info.name .. " (" .. itemid .. ")"
+        end
+    end
+    itemLabelCache[itemid] = label
+    return label
+end
+
+local function launchJob(jobName, fn)
+    if state.busy then state.status = "Masih ada proses: " .. state.job; return end
+    state.busy = true
+    state.job = jobName
+    state.stop = false
+    state.status = jobName .. "..."
+    local function runner()
+        local ok, err = pcall(fn)
+        if not ok then
+            state.status = "ERROR: " .. tostring(err)
+            log(state.status)
+        end
+        state.busy = false
+        state.job = ""
+        state.stop = false
+    end
+    if type(RunThread) == "function" then
+        local ok, err = pcall(RunThread, runner)
+        if not ok then
+            state.busy = false; state.job = ""
+            state.status = "RunThread gagal: " .. tostring(err)
+        end
+    else
+        runner()
+    end
+end
+
+local function refreshList()
+    launchJob("Refresh List", function()
+        refreshInternal()
+        state.inventory = inventoryMap()
+        if state.selected then
+            local snap, materials = parseSnapshot(state.selected)
+            state.snapshot, state.materials = snap, materials
+        end
+    end)
+end
+
+local function selectWorld(name)
+    if state.busy then return end
+    state.selected = name
+    state.snapshot = nil
+    state.materials = {}
+    state.materialPage = 1
+    state.confirmDelete = false
+    launchJob("Muat " .. name, function()
+        local snap, materials = parseSnapshot(name)
+        state.snapshot, state.materials = snap, materials
+        state.inventory = inventoryMap()
+        state.status = "Dipilih: " .. name .. " | " .. snap.width .. "x" .. snap.height .. " | " .. #materials .. " jenis material"
+    end)
+end
+
+local function copyWorld()
+    launchJob("Copy World", function()
+        local snap = snapshotCurrentWorld()
+        if state.stop then error("Copy dibatalkan") end
+        local fgCount, bgCount = saveSnapshot(snap)
+        state.selected = snap.name
+        state.snapshot = snap
+        local loaded, materials = parseSnapshot(snap.name)
+        state.snapshot, state.materials = loaded, materials
+        state.materialPage = 1
+        state.inventory = inventoryMap()
+        state.status = "Tersimpan " .. snap.name .. ".txt | FG " .. fgCount .. " | BG " .. bgCount
+        log(state.status)
+    end)
+end
+
+local function deleteWorld()
+    if not state.selected then return end
+    local name = state.selected
+    launchJob("Hapus " .. name, function()
+        local filepath = pathOfWorld(name)
+        if not (os and type(os.remove) == "function") then error("os.remove tidak tersedia") end
+        local success, err = os.remove(filepath)
+        if not success then error("Gagal hapus: " .. tostring(err)) end
+        local remaining = {}
+        for _, n in ipairs(readIndex()) do if n ~= name then remaining[#remaining+1] = n end end
+        local ok, idxErr = writeIndex(remaining)
+        if not ok then error("World terhapus tetapi index gagal: " .. tostring(idxErr)) end
+        state.names = remaining
+        state.selected = nil; state.snapshot = nil; state.materials = {}
+        state.confirmDelete = false
+        state.status = "Dihapus: " .. name
+        log(state.status)
+    end)
+end
+
+-- ------------------- FAST TARGET PASTE (V2) -------------------
+-- 1) GetTiles() satu kali -> indeks tile world saat ini.
+-- 2) Bandingkan dengan .txt satu kali -> antrean hanya tile yang membutuhkan aksi.
+-- 3) FindPath hanya ke kelompok yang memiliki target aktif.
+-- 4) Tidak ada GetTile() berulang di inner loop (opsional untuk verifikasi tiap target).
+
+local function readWorldIndex(world)
+    if type(GetTiles) ~= "function" then
+        error("Paste cepat memerlukan API GetTiles() dari Bothax")
+    end
+    local ok, tiles = pcall(GetTiles)
+    if not ok or type(tiles) ~= "table" then
+        error("GetTiles() gagal mengembalikan daftar tile")
+    end
+    local index, count = {}, 0
+    for _, tile in pairs(tiles) do
+        local x, y = extractTileXY(tile)
+        if x and y and x >= 0 and y >= 0 and x < world.width and y < world.height then
+            local key = cellIndex(world.width, x, y)
+            if index[key] == nil then count = count + 1 end
+            index[key] = {
+                fg = math.floor(tonumber(tile.fg) or 0),
+                bg = math.floor(tonumber(tile.bg) or 0)
+            }
+        end
+    end
+    if count == 0 then error("GetTiles() mengembalikan 0 tile valid") end
+    return index, count
+end
+
+local function currentPlayerTile()
+    local p = type(GetLocal) == "function" and GetLocal() or nil
+    if not p or not p.pos then return nil, nil end
+    local px, py = tonumber(p.pos.x), tonumber(p.pos.y)
+    if not px or not py then return nil, nil end
+    return math.floor(px / 32), math.floor(py / 32)
+end
+
+local function interruptibleSleep(ms)
+    local remaining = ms
+    while remaining > 0 do
+        if state.stop then return false end
+        local step = math.min(40, remaining)
+        if type(Sleep) == "function" then Sleep(step) end
+        remaining = remaining - step
+    end
+    return not state.stop
+end
+
+local function placeItem(id, x, y)
+    local me = type(GetLocal) == "function" and GetLocal() or nil
+    if not me or not me.pos then error("GetLocal tidak memiliki posisi") end
+    if type(SetItemSelected) == "function" then pcall(SetItemSelected, id) end
+    SendPacketRaw(false, {
+        type = 3, value = id,
+        x = me.pos.x, y = me.pos.y,
+        px = x, py = y
+    })
+end
+
+local function buildTaskGroups(snap, live, stats)
+    local nGroups = math.ceil(snap.width / CFG.groupSize)
+    local groups = {}
+    local targets = 0
+    for y = 0, snap.height - 1 do
+        if state.stop then return {}, 0, nGroups end
+        for x = 0, snap.width - 1 do
+            local idx = cellIndex(snap.width, x, y)
+            local src, dest = snap.cells[idx], live[idx]
+            if not dest then
+                -- Unknown tiles are deliberately NOT overwritten.
+                stats.unreadable = stats.unreadable + 1
+            elseif src then
+                local required = {}
+                for _, layer in ipairs({"bg", "fg"}) do
+                    local want = tonumber(src[layer]) or 0
+                    local has = tonumber(dest[layer]) or 0
+                    if want == has then
+                        if want ~= 0 then stats.matched = stats.matched + 1 end
+                    elseif want == 0 or has ~= 0 then
+                        stats.conflicts = stats.conflicts + 1
+                    else
+                        required[#required + 1] = {layer=layer, id=want}
+                    end
+                end
+                if #required > 0 then
+                    local g = math.floor(x / CFG.groupSize)
+                    local key = y * nGroups + g + 1
+                    local group = groups[key]
+                    if not group then
+                        group = {x0=g*CFG.groupSize,
+                            x1=math.min(snap.width-1,(g+1)*CFG.groupSize-1),
+                            y=y, gi=g+1, tasks={}}
+                        groups[key] = group
+                    end
+                    group.tasks[#group.tasks+1] = {x=x,y=y,idx=idx,actions=required}
+                    targets = targets + #required
+                end
+            end
+        end
+    end
+    -- Urutkan hanya kelompok yang punya pekerjaan (baris zig-zag/snake).
+    local ordered = {}
+    for y=0,snap.height-1 do
+        local reverse = (y%2==1)
+        if not reverse then
+            for g=0,nGroups-1 do
+                local group = groups[y*nGroups+g+1]
+                if group then ordered[#ordered+1] = group end
+            end
+        else
+            for g=nGroups-1,0,-1 do
+                local group = groups[y*nGroups+g+1]
+                if group then ordered[#ordered+1] = group end
+            end
+        end
+    end
+    return ordered, targets, nGroups
+end
+
+-- Berdiri SATU TILE DI BAWAH target: standY = targetY+1, sehingga
+-- saat place ke targetY, block berada di Y-1 relatif terhadap player.
+-- Tidak ada fallback ke targetY-1 (atas target). Pada baris terakhir atau
+-- ketika semua posisi bawah terhalang, boleh mencoba posisi SEJAJAR.
+-- Fungsi ini digunakan bersama oleh paste utama dan auto-repair.
+local function moveToActiveGroup(group, live, width, height)
+    if not CFG.useFindPath then return true end
+    if type(FindPath) ~= "function" then return false end
+
+    local center = math.floor((group.x0 + group.x1) / 2)
+    local targetY = group.y
+    local belowY = targetY + 1
+    local belowCandidates = {}
+    local sideCandidates = {}
+    local seen = {}
+
+    local function addCandidate(tier, x, y)
+        if x < 0 or y < 0 or x >= width or y >= height then return end
+        local idx = cellIndex(width, x, y)
+        local tile = live[idx]
+        if not tile or tonumber(tile.fg) ~= 0 then return end
+        local key = y * width + x
+        if seen[key] then return end
+        seen[key] = true
+        tier[#tier + 1] = {x=x, y=y}
+    end
+
+    -- PRIORITAS 1: lokasi di bawah grup target. Pemain akan place ke ATAS.
+    -- Coba tengah dahulu, kemudian samping agar tidak terhalang block.
+    if belowY < height then
+        addCandidate(belowCandidates, center, belowY)
+        addCandidate(belowCandidates, center - 1, belowY)
+        addCandidate(belowCandidates, center + 1, belowY)
+        addCandidate(belowCandidates, center - 2, belowY)
+        addCandidate(belowCandidates, center + 2, belowY)
+    end
+
+    -- PRIORITAS 2: fallback SEJAJAR bila semua FindPath bawah gagal.
+    -- Ini juga diperlukan untuk Y paling bawah karena Y+1 di luar world.
+    if CFG.allowSameRowFallback then
+        addCandidate(sideCandidates, group.x0 - 1, targetY)
+        addCandidate(sideCandidates, group.x1 + 1, targetY)
+        addCandidate(sideCandidates, center, targetY)
+        addCandidate(sideCandidates, center - 1, targetY)
+        addCandidate(sideCandidates, center + 1, targetY)
+        addCandidate(sideCandidates, center - 2, targetY)
+        addCandidate(sideCandidates, center + 2, targetY)
+    end
+
+    local function tryCandidates(tier)
+        -- Penting: Y harus tepat sama. Toleransi Y=1 dari V4 dapat
+        -- menganggap pemain yang berada DI ATAS target sudah tepat.
+        local currX, currY = currentPlayerTile()
+        for _, candidate in ipairs(tier) do
+            if currX == candidate.x and currY == candidate.y then
+                return true
+            end
+        end
+        for _, candidate in ipairs(tier) do
+            if state.stop then return false end
+            for _ = 1, CFG.teleportRetries do
+                if state.stop then return false end
+                pcall(FindPath, candidate.x, candidate.y)
+                if not interruptibleSleep(CFG.teleportWaitMs) then return false end
+                local x, y = currentPlayerTile()
+                if x == candidate.x and y == candidate.y then
+                    return true
+                end
+            end
+        end
+        return false
+    end
+
+    if tryCandidates(belowCandidates) then return true end
+    if state.stop then return false end
+    if tryCandidates(sideCandidates) then return true end
+    return false
+end
+
+local function checkSingleTarget(x,y)
+    if not CFG.recheckTargetWithGetTile or type(GetTile)~="function" then
+        return nil -- do not trigger blocking GetTile() calls in fast mode
+    end
+    local ok,tile = pcall(GetTile,x,y)
+    if ok and tile then return tile end
+    return false
+end
+
+-- Pekerjaan paste utama & penambalan memakai fungsi yang SAMA.
+-- Perbedaannya hanya peta live (GetTiles) yang dibaca ulang setiap repair.
+local function pasteWorld()
+    if not state.snapshot or not state.selected then
+        state.status = "Pilih world tersimpan terlebih dahulu"; return
+    end
+    local snap, sourceName = state.snapshot, state.selected
+    launchJob("Paste " .. sourceName, function()
+        local w, err = worldInfo()
+        if not w then error(err) end
+        if w.width ~= snap.width or w.height ~= snap.height then
+            error("Ukuran tujuan "..w.width.."x"..w.height.." tidak sama dengan copy "..snap.width.."x"..snap.height)
+        end
+        if type(SendPacketRaw) ~= "function" then error("SendPacketRaw tidak tersedia") end
+        local p = {
+            row=0,group=0,groups=0,sent=0,matched=0,conflicts=0,
+            noStock=0,pathFails=0,unreadable=0,queued=0,verified=0,remaining=0,
+            phase="Persiapan",repairPass=0,repairQueued=0,repairSent=0,repaired=0
+        }
+        state.progress=p
+        local stock = inventoryMap()
+        local nextInventoryRefresh = math.max(1,CFG.inventoryRefreshEvery)
+        local function assertSameWorld()
+            local current=GetWorld()
+            if not current or normalizeName(tostring(current.name or "")) ~= w.name then
+                error("World berpindah saat paste/repair; dihentikan")
+            end
+        end
+
+        -- Satu GetTiles() membangun indeks O(1), lalu antrean HANYA tile kosong.
+        -- Tile yang sudah terisi block lain bukan kandidat perbaikan otomatis.
+        local function scanTargets(phase)
+            if state.stop then return {}, {}, 0 end
+            assertSameWorld()
+            state.status=phase.." | scan GetTiles()..."
+            local live, loaded=readWorldIndex(w)
+            local scanStats={matched=0,conflicts=0,unreadable=0}
+            local groups, needed=buildTaskGroups(snap,live,scanStats)
+            p.verified=scanStats.matched
+            p.matched=scanStats.matched
+            p.conflicts=scanStats.conflicts
+            p.unreadable=scanStats.unreadable
+            p.remaining=needed
+            log(phase..": "..needed.." aksi masih kosong, "..#groups.." grup; "..
+                scanStats.conflicts.." konflik, "..scanStats.unreadable.." tile tak terbaca (index "..loaded..").")
+            return groups,live,needed
+        end
+
+        local function processGroups(groups,live,totalTargets,phase,isRepair)
+            p.phase=phase
+            for i,group in ipairs(groups) do
+                if state.stop then return end
+                assertSameWorld()
+                p.row,p.group,p.groups=group.y,group.gi,i
+                state.status=phase.." | grup "..i.."/"..#groups..
+                    " | sent "..p.sent.." | sisa scan "..totalTargets
+                local moved=moveToActiveGroup(group,live,w.width,w.height)
+                if state.stop then return end
+                if not moved then
+                    p.pathFails=p.pathFails+1
+                else
+                    -- Setiap antrean dibangun baru. Urutan pada baris ganjil dibalik.
+                    if group.y%2==1 then
+                        local tasks=group.tasks
+                        for a=1,math.floor(#tasks/2) do
+                            local b=#tasks-a+1
+                            tasks[a],tasks[b]=tasks[b],tasks[a]
+                        end
+                    end
+                    for _,task in ipairs(group.tasks) do
+                        if state.stop then return end
+                        local single=checkSingleTarget(task.x,task.y)
+                        if single==false then
+                            p.unreadable=p.unreadable+1
+                        else
+                            local cell=live[task.idx]
+                            if single then
+                                cell.fg=tonumber(single.fg) or 0
+                                cell.bg=tonumber(single.bg) or 0
+                            end
+                            for _,action in ipairs(task.actions) do
+                                if state.stop then return end
+                                local layer,id=action.layer,action.id
+                                if cell[layer] == id then
+                                    -- Sudah sesuai setelah scan dibuat.
+                                elseif cell[layer] ~= 0 then
+                                    -- Jangan menimpa block berbeda.
+                                    p.conflicts=p.conflicts+1
+                                else
+                                    if CFG.inventoryCheck and p.sent>=nextInventoryRefresh then
+                                        stock=inventoryMap()
+                                        nextInventoryRefresh=p.sent+math.max(1,CFG.inventoryRefreshEvery)
+                                    end
+                                    local have=stock[id] or 0
+                                    if CFG.inventoryCheck and have<=0 then
+                                        p.noStock=p.noStock+1
+                                    else
+                                        placeItem(id,task.x,task.y)
+                                        p.sent=p.sent+1
+                                        if isRepair then p.repairSent=p.repairSent+1 end
+                                        stock[id]=math.max(0,have-1)
+                                        -- Prediksi sementara saja; scan berikutnya baca server lagi.
+                                        cell[layer]=id
+                                        if not interruptibleSleep(CFG.placeDelayMs) then return end
+                                        if CFG.logEveryActions>0 and p.sent%CFG.logEveryActions==0 then
+                                            log(phase..": total sent "..p.sent.." | Y="..group.y)
+                                        end
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end
+                if not interruptibleSleep(CFG.betweenGroupsMs) then return end
+            end
+        end
+
+        local groups,live,needed=scanTargets("Paste awal")
+        p.queued=needed
+        if not state.stop then processGroups(groups,live,needed,"PASTE UTAMA",false) end
+
+        -- PENTING: jangan repair saat user memilih HENTIKAN PASTE.
+        if not state.stop and CFG.verifyAfterPaste then
+            if interruptibleSleep(CFG.repairSettleMs) then
+                local remainingGroups, fresh, remaining=scanTargets("Verifikasi utama")
+                local afterMain=remaining
+                local noProgress=0
+                if CFG.autoRepair and remaining>0 then
+                    local limit=math.max(0,math.floor(tonumber(CFG.maxRepairPasses) or 0))
+                    for pass=1,limit do
+                        if state.stop or remaining==0 then break end
+                        p.repairPass=pass
+                        p.phase="TAMBAL "..pass.."/"..limit
+                        p.repairQueued=p.repairQueued+remaining
+                        log("Mulai penambalan "..pass.."/"..limit.." untuk "..remaining.." tile/layer kosong.")
+                        local before=remaining
+                        processGroups(remainingGroups,fresh,remaining,p.phase,true)
+                        if state.stop then break end
+                        if not interruptibleSleep(CFG.repairSettleMs) then break end
+                        remainingGroups,fresh,remaining=scanTargets("Cek tambalan "..pass)
+                        if remaining < before then
+                            noProgress=0
+                        else
+                            noProgress=noProgress+1
+                        end
+                        if noProgress>=CFG.maxNoProgressPasses then
+                            log("Repair berhenti: sisa tidak berkurang selama "..noProgress.." putaran. "..
+                                "Kemungkinan stok habis, path gagal, atau server menolak placement.")
+                            break
+                        end
+                    end
+                end
+                p.repaired=math.max(0,afterMain-p.remaining)
+            end
+        end
+        -- Saat stop, jangan lakukan scan/retry tambahan.
+        local ended=state.stop and "DIHENTIKAN" or "SELESAI"
+        state.status=ended.." | sent "..p.sent.." | sisa "..p.remaining..
+            " | repair "..p.repairPass.." putaran (sent "..p.repairSent..")"..
+            " | cocok "..p.verified.." | konflik "..p.conflicts..
+            " | stok kosong "..p.noStock.." | gagal path "..p.pathFails..
+            " | tile tak terbaca "..p.unreadable
+        log(state.status)
+        state.inventory=inventoryMap()
+    end)
+end
+
+-- ------------------------- ImGui UI -------------------------
+local function uiText(txt)
+    if ImGui and type(ImGui.Text)=="function" then ImGui.Text(tostring(txt)) end
+end
+local function uiButton(label, callback)
+    if ImGui and type(ImGui.Button)=="function" and ImGui.Button(label) then callback() end
+end
+local function sameLine()
+    if ImGui and type(ImGui.SameLine)=="function" then ImGui.SameLine() end
+end
+local function divider()
+    if ImGui and type(ImGui.Separator)=="function" then ImGui.Separator() end
+end
+local function drawUI()
+    if not state.uiVisible then return end
+    if not ImGui or type(ImGui.Begin)~="function" then return end
+    local visible = ImGui.Begin("World Copy Paste | Bothax PC")
+    if visible then
+        uiText("WORLD COPY PASTE V5 | PLACE DI ATAS PLAYER + REPAIR")
+        uiText("F1 = tampil / sembunyikan panel (job tetap berjalan)")
+        uiText("Place ke Y-1 dari player; Y terakhir pakai posisi sejajar")
+        local current = worldInfo()
+        uiText("World sekarang: " .. (current and (current.name.." ("..current.width.."x"..current.height..")") or "tidak berada di world"))
+        uiText("Status: " .. state.status)
+        divider()
+        if not state.busy then
+            uiButton("Copy World Ini", copyWorld)
+            sameLine()
+            uiButton("Refresh List", refreshList)
+        else
+            uiText("Proses aktif: " .. state.job)
+        end
+        uiText("Folder: " .. state.storage)
+        divider()
+        uiText("WORLD TERSIMPAN (" .. #state.names .. ")")
+        if #state.names == 0 then uiText("Belum ada world. Klik Copy World Ini.") end
+        local pages = math.max(1, math.ceil(#state.names/CFG.worldsPerPage))
+        state.worldPage = math.max(1, math.min(state.worldPage, pages))
+        local a = (state.worldPage-1)*CFG.worldsPerPage+1
+        local b = math.min(#state.names, a+CFG.worldsPerPage-1)
+        for i=a,b do
+            local name = state.names[i]
+            if name then
+                local prefix = (name == state.selected) and "[PILIH] " or "[World] "
+                if not state.busy then
+                    uiButton(prefix .. name .. "##world"..i, function() selectWorld(name) end)
+                else
+                    uiText(prefix .. name)
+                end
+            end
+        end
+        if pages>1 then
+            uiButton("< World", function() state.worldPage=math.max(1,state.worldPage-1) end)
+            sameLine(); uiText(state.worldPage.." / "..pages); sameLine()
+            uiButton("World >",function() state.worldPage=math.min(pages,state.worldPage+1) end)
+        end
+        divider()
+        if state.selected then
+            uiText("Terpilih: " .. state.selected)
+            local snap = state.snapshot
+            if snap then
+                uiText("Ukuran: "..snap.width.." x "..snap.height.." | Material: "..#state.materials.." jenis")
+                uiText("MATERIAL DIPERLUKAN (FG + BG)")
+                if not state.busy then
+                    uiButton("Refresh Material", function() state.inventory=inventoryMap() end)
+                end
+                local pagesM = math.max(1,math.ceil(#state.materials/CFG.materialsPerPage))
+                state.materialPage = math.max(1,math.min(state.materialPage,pagesM))
+                local m1=(state.materialPage-1)*CFG.materialsPerPage+1
+                local m2=math.min(#state.materials,m1+CFG.materialsPerPage-1)
+                for i=m1,m2 do
+                    local mat=state.materials[i]
+                    local have=state.inventory[mat.id] or 0
+                    local missing=math.max(0,mat.needed-have)
+                    uiText(itemLabel(mat.id).." | butuh "..mat.needed.." | punya "..have..
+                        (missing>0 and (" | kurang "..missing) or " | cukup"))
+                end
+                if pagesM>1 then
+                    uiButton("< Material", function() state.materialPage=math.max(1,state.materialPage-1) end)
+                    sameLine();uiText(state.materialPage.." / "..pagesM);sameLine()
+                    uiButton("Material >",function() state.materialPage=math.min(pagesM,state.materialPage+1) end)
+                end
+                divider()
+                if not state.busy then
+                    uiButton("PASTE",pasteWorld)
+                    sameLine()
+                    if not state.confirmDelete then
+                        uiButton("Hapus", function() state.confirmDelete=true end)
+                    else
+                        uiButton("YA, HAPUS",deleteWorld)
+                        sameLine()
+                        uiButton("Batal Hapus",function() state.confirmDelete=false end)
+                    end
+                end
+            else
+                uiText("Sedang membaca file world...")
+            end
+        else
+            uiText("Pilih world di daftar untuk melihat material dan paste.")
+        end
+        if state.busy and state.job:find("Paste",1,true) then
+            divider()
+            uiButton("HENTIKAN PASTE",function() state.stop=true; state.status="Menghentikan paste..." end)
+            local p=state.progress
+            uiText("Tahap: "..(p.phase or "-").." | Baris Y: "..p.row.." | grup: "..p.groups)
+            uiText("Target awal: "..(p.queued or 0).." | sisa: "..(p.remaining or 0))
+            uiText("Repair ke-"..(p.repairPass or 0).." | packet repair: "..(p.repairSent or 0))
+            uiText("Sent "..p.sent.." | Cocok "..p.matched.." | Konflik "..p.conflicts)
+            uiText("Stok kurang "..p.noStock.." | FindPath gagal "..p.pathFails.." | data hilang "..(p.unreadable or 0))
+        end
+        divider()
+        uiText("Tidak membeli material. Tidak punch/clear blok berbeda.")
+        uiText("Copy hanya item fg/bg; isi storage/sign/lock tidak ikut.")
+    end
+    ImGui.End()
+end
+
+-- Bothax PC documents OnInput for Windows. VK_F1 (virtual-key code) = 112.
+-- OnInput observes an actual key press; use a short debounce for key-repeat.
+AddHook("OnInput", "WorldCopyPasteF1Toggle", function(key)
+    local vk = tonumber(key)
+    if vk == 112 then
+        local now = (os and type(os.clock) == "function") and os.clock() or nil
+        if now == nil or (now - state.lastF1Toggle) >= 0.35 then
+            state.uiVisible = not state.uiVisible
+            if now then state.lastF1Toggle = now end
+            log("F1: panel " .. (state.uiVisible and "DITAMPILKAN" or "DISEMBUNYIKAN"))
+        end
+    end
+    return false -- tidak memblokir tombol untuk game
+end)
+
+initStoragePath()
+AddHook("OnDraw", "WorldCopyPasteUI", function()
+    local ok, err = pcall(drawUI)
+    if not ok then
+        -- avoid console spam each frame: show first error only
+        if not state.uiError or state.uiError ~= tostring(err) then
+            state.uiError=tostring(err);log("ImGui error: "..state.uiError)
+        end
+    end
+end)
+refreshList()
+log("V5 place di atas player (targetY=standY-1) + repair. F1 panel. Folder: " .. state.storage)
