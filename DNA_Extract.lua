@@ -3,7 +3,7 @@
 -- No outgoing DNAGET / backpack actions while other players are in the world.
 
 local CFG = {
-    itemID = 3950,
+    itemID = 3942,
     threshold = 100,
     takeCount = 100,
     dnagetX = 44,
